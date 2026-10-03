@@ -29,11 +29,11 @@ def setup():
         command.upgrade(config,'head')
     maker=sessionmaker(engine,expire_on_commit=False)
     with maker() as s:
-        s.add_all([Station(id=1,name='Pilot',code='P1',region='Central',district='Agona East'),Station(id=2,name='Other',code='P2',region='Central',district='Other')]);s.flush()
-        s.add_all([User(id=1,email='owner@test.com',name='Owner',password=hash_password('secure-password'),role='owner'),User(id=2,email='attendant@test.com',name='Attendant',password=hash_password('secure-password'),role='attendant',station_id=1)]);s.flush()
-        s.add(Product(id=1,station_id=1,name='Petrol',price=Decimal('15.5')));s.flush()
-        s.add(Tank(id=1,station_id=1,product_id=1,name='Tank',capacity=1000,stock=500,reorder=100));s.flush()
-        s.add(Nozzle(id=1,station_id=1,tank_id=1,name='Pump 1 A',meter=1000));s.flush()
+        s.add_all([Station(name='Pilot',code='P1',region='Central',district='Agona East'),Station(name='Other',code='P2',region='Central',district='Other')]);s.flush()
+        s.add_all([User(email='owner@test.com',name='Owner',password=hash_password('secure-password'),role='owner'),User(email='attendant@test.com',name='Attendant',password=hash_password('secure-password'),role='attendant',station_id=1)]);s.flush()
+        s.add(Product(station_id=1,name='Petrol',price=Decimal('15.5')));s.flush()
+        s.add(Tank(station_id=1,product_id=1,name='Tank',capacity=1000,stock=500,reorder=100));s.flush()
+        s.add(Nozzle(station_id=1,tank_id=1,name='Pump 1 A',meter=1000));s.flush()
         from app.operations import StockMovement, today
         s.add(StockMovement(station_id=1,tank_id=1,business_date=today(),quantity=500,source='opening',reference='1'));s.commit()
     def override():
