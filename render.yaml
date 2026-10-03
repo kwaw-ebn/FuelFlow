@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: fuelflow-api
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: CORS_ORIGINS
+        sync: false
+  - type: web
+    name: fuelflow-web
+    runtime: node
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    startCommand: npm start -- --hostname 0.0.0.0 --port $PORT
+    envVars:
+      - key: NEXT_PUBLIC_API_URL
+        sync: false
