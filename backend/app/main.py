@@ -1,17 +1,17 @@
 import os, secrets, hashlib, hmac
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Annotated
 import jwt
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
-from sqlalchemy import create_engine, String, Numeric, ForeignKey, DateTime, Boolean, UniqueConstraint, select
+from sqlalchemy import create_engine, String, Numeric, ForeignKey, DateTime, Boolean, UniqueConstraint, CheckConstraint, Index, Date, JSON, Text, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker, Session
 
 DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///./fuelflow.db').replace('postgres://', 'postgresql+psycopg://').replace('postgresql://', 'postgresql+psycopg://')
-engine = create_engine(DATABASE_URL, **({'connect_args': {'check_same_thread': False}} if DATABASE_URL.startswith('sqlite') else {}))
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, **({'connect_args': {'check_same_thread': False}} if DATABASE_URL.startswith('sqlite') else {}))
 SessionLocal = sessionmaker(engine, expire_on_commit=False)
 class Base(DeclarativeBase): pass
 class User(Base):
@@ -23,6 +23,9 @@ class User(Base):
     role: Mapped[str] = mapped_column(String(30))
     station_id: Mapped[int | None] = mapped_column(ForeignKey('stations.id'))
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+    session_version: Mapped[int] = mapped_column(default=0, server_default='0')
+    mfa_secret: Mapped[str | None] = mapped_column(Text)
+    mfa_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text('false'))
 class Station(Base):
     __tablename__ = 'stations'
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -32,12 +35,14 @@ class Station(Base):
     district: Mapped[str] = mapped_column(String(120))
 class Product(Base):
     __tablename__ = 'fuel_products'
+    __table_args__ = (CheckConstraint('price > 0', name='ck_product_price'),)
     id: Mapped[int] = mapped_column(primary_key=True)
     station_id: Mapped[int] = mapped_column(ForeignKey('stations.id'), index=True)
     name: Mapped[str] = mapped_column(String(60))
     price: Mapped[Decimal] = mapped_column(Numeric(14, 4))
 class Tank(Base):
     __tablename__ = 'tanks'
+    __table_args__ = (CheckConstraint('capacity > 0 AND stock >= 0 AND stock <= capacity AND reorder >= 0 AND reorder <= capacity', name='ck_tank_volume'),)
     id: Mapped[int] = mapped_column(primary_key=True)
     station_id: Mapped[int] = mapped_column(ForeignKey('stations.id'), index=True)
     product_id: Mapped[int] = mapped_column(ForeignKey('fuel_products.id'))
@@ -47,6 +52,7 @@ class Tank(Base):
     reorder: Mapped[Decimal] = mapped_column(Numeric(14, 3))
 class Nozzle(Base):
     __tablename__ = 'nozzles'
+    __table_args__ = (CheckConstraint('meter >= 0', name='ck_nozzle_meter'),)
     id: Mapped[int] = mapped_column(primary_key=True)
     station_id: Mapped[int] = mapped_column(ForeignKey('stations.id'), index=True)
     tank_id: Mapped[int] = mapped_column(ForeignKey('tanks.id'))
@@ -54,6 +60,11 @@ class Nozzle(Base):
     meter: Mapped[Decimal] = mapped_column(Numeric(16, 3))
 class Shift(Base):
     __tablename__ = 'shifts'
+    __table_args__ = (
+        CheckConstraint('closing IS NULL OR closing >= opening', name='ck_shift_meter'),
+        CheckConstraint('cash >= 0 AND momo >= 0 AND card >= 0 AND credit >= 0 AND litres >= 0 AND price > 0', name='ck_shift_amounts'),
+        Index('uq_active_nozzle_shift', 'nozzle_id', unique=True, postgresql_where=text("status IN ('open','submitted')"), sqlite_where=text("status IN ('open','submitted')")),
+    )
     id: Mapped[int] = mapped_column(primary_key=True)
     station_id: Mapped[int] = mapped_column(ForeignKey('stations.id'), index=True)
     nozzle_id: Mapped[int] = mapped_column(ForeignKey('nozzles.id'))
@@ -66,12 +77,14 @@ class Shift(Base):
     cash: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
     momo: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
     card: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    credit: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0, server_default='0')
+    business_date: Mapped[date] = mapped_column(Date, default=lambda: datetime.now(timezone.utc).date(), index=True)
     variance: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
     status: Mapped[str] = mapped_column(String(20), default='open')
     started: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 class Delivery(Base):
     __tablename__ = 'fuel_deliveries'
-    __table_args__ = (UniqueConstraint('station_id', 'reference'),)
+    __table_args__ = (UniqueConstraint('station_id', 'reference'), CheckConstraint('received_litres > 0 AND waybill_litres > 0 AND cost_per_litre > 0', name='ck_delivery_amounts'))
     id: Mapped[int] = mapped_column(primary_key=True)
     station_id: Mapped[int] = mapped_column(ForeignKey('stations.id'), index=True)
     tank_id: Mapped[int] = mapped_column(ForeignKey('tanks.id'))
@@ -80,11 +93,18 @@ class Delivery(Base):
     waybill_litres: Mapped[Decimal] = mapped_column(Numeric(14, 3))
     received_litres: Mapped[Decimal] = mapped_column(Numeric(14, 3))
     cost_per_litre: Mapped[Decimal] = mapped_column(Numeric(14, 4))
+    business_date: Mapped[date] = mapped_column(Date, default=lambda: datetime.now(timezone.utc).date(), index=True)
+    created: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 class Expense(Base):
     __tablename__ = 'expenses'
+    __table_args__ = (CheckConstraint('amount > 0', name='ck_expense_amount'),)
     id: Mapped[int] = mapped_column(primary_key=True)
     station_id: Mapped[int] = mapped_column(ForeignKey('stations.id'), index=True)
     description: Mapped[str] = mapped_column(String(300))
+    business_date: Mapped[date] = mapped_column(Date, default=lambda: datetime.now(timezone.utc).date(), index=True)
+    status: Mapped[str] = mapped_column(String(20), default='pending', server_default='pending')
+    recorded_by: Mapped[int | None] = mapped_column(ForeignKey('users.id'))
+    approved_by: Mapped[int | None] = mapped_column(ForeignKey('users.id'))
     amount: Mapped[Decimal] = mapped_column(Numeric(14, 2))
     created: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 class Audit(Base):
@@ -110,12 +130,14 @@ def hash_password(password):
 def verify_password(password, hashed):
     salt, value = hashed.split(':')
     return hmac.compare_digest(value, hashlib.scrypt(password.encode(), salt=salt.encode(), n=16384, r=8, p=1).hex())
-def current(db: DB, auth: Annotated[HTTPAuthorizationCredentials, Depends(bearer)]):
+def current(request: Request, db: DB, auth: Annotated[HTTPAuthorizationCredentials, Depends(bearer)]):
     try:
         payload = jwt.decode(auth.credentials, secret(), algorithms=['HS256'], issuer='fuelflow', audience='fuelflow')
         user = db.get(User, int(payload['sub']))
     except (jwt.PyJWTError, ValueError, KeyError): raise HTTPException(401, 'Invalid or expired session')
     if not user or not user.active: raise HTTPException(401, 'Account unavailable')
+    from .security import validate_session
+    validate_session(db, user, payload, request)
     return user
 Actor = Annotated[User, Depends(current)]
 def permit(user, *roles):
@@ -130,21 +152,12 @@ def audit(db, actor, action, details): db.add(Audit(user_id=actor.id, action=act
 def save(db, actor, obj, action):
     db.add(obj); db.flush(); audit(db, actor, action, f'{obj.__tablename__}:{obj.id}'); db.commit(); return obj
 
-app = FastAPI(title='FuelFlow Ghana', version='0.1.0')
+app = FastAPI(title='FuelFlow Ghana', version='0.2.0', docs_url=None if os.getenv('APP_ENV')=='production' else '/docs', redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=os.getenv('CORS_ORIGINS', 'http://localhost:3000').split(','), allow_credentials=False, allow_methods=['GET','POST'], allow_headers=['Authorization','Content-Type'])
 @app.get('/health')
 def health(): return {'status': 'ok'}
-class Login(BaseModel):
-    email: str
-    password: str
-@app.post('/auth/login')
-def login(body: Login, db: DB):
-    user = db.scalar(select(User).where(User.email == body.email.lower()))
-    if not user or not user.active or not verify_password(body.password, user.password): raise HTTPException(401, 'Invalid credentials')
-    token = jwt.encode({'sub': str(user.id), 'iss': 'fuelflow', 'aud': 'fuelflow', 'exp': datetime.now(timezone.utc)+timedelta(minutes=30)}, secret(), algorithm='HS256')
-    return {'access_token': token, 'token_type': 'bearer'}
 @app.get('/auth/me')
-def me(actor: Actor): return {'id':actor.id,'name':actor.name,'email':actor.email,'role':actor.role,'station_id':actor.station_id}
+def me(actor: Actor): return {'id':actor.id,'name':actor.name,'email':actor.email,'role':actor.role,'station_id':actor.station_id,'mfa_enabled':actor.mfa_enabled}
 class StationInput(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     code: str = Field(min_length=1, max_length=30)
@@ -161,7 +174,7 @@ def station_list(db: DB, actor: Actor):
     if actor.role!='owner': stmt=stmt.where(Station.id==actor.station_id)
     return db.scalars(stmt).all()
 class StaffInput(BaseModel):
-    email: str = Field(min_length=5, max_length=254)
+    email: str = Field(min_length=5, max_length=254, pattern=r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
     name: str = Field(min_length=1, max_length=120)
     password: str = Field(min_length=12, max_length=128)
     role: str = Field(pattern='^(manager|supervisor|attendant|accountant|auditor)$')
@@ -175,7 +188,7 @@ def staff_create(body: StaffInput, db: DB, actor: Actor):
 @app.get('/staff')
 def staff_list(station_id: int, db: DB, actor: Actor):
     permit(actor,'owner','manager','supervisor'); scoped(actor,station_id)
-    return [{'id':u.id,'name':u.name,'role':u.role,'email':u.email} for u in db.scalars(select(User).where(User.station_id==station_id)).all()]
+    return [{'id':u.id,'name':u.name,'role':u.role,'email':u.email,'active':u.active} for u in db.scalars(select(User).where(User.station_id==station_id)).all()]
 class ProductInput(BaseModel):
     station_id: int
     name: str = Field(min_length=1,max_length=60)
@@ -183,7 +196,10 @@ class ProductInput(BaseModel):
 @app.post('/products')
 def product_create(body: ProductInput, db: DB, actor: Actor):
     permit(actor,'owner'); scoped(actor,body.station_id); get(db,Station,body.station_id)
-    return save(db,actor,Product(**body.model_dump()),'product.create')
+    from .operations import FuelPrice
+    product=Product(**body.model_dump());db.add(product);db.flush()
+    db.add(FuelPrice(product_id=product.id,previous_price=body.price,price=body.price,reason='Initial price',changed_by=actor.id))
+    return save(db,actor,product,'product.create')
 class TankInput(BaseModel):
     station_id: int
     product_id: int
@@ -196,7 +212,11 @@ def tank_create(body: TankInput, db: DB, actor: Actor):
     permit(actor,'owner'); scoped(actor,body.station_id)
     product=get(db,Product,body.product_id)
     if product.station_id!=body.station_id or body.stock>body.capacity or body.reorder>body.capacity: raise HTTPException(422,'Invalid tank product or capacity')
-    return save(db,actor,Tank(**body.model_dump()),'tank.create')
+    from .operations import writable_day, movement
+    writable_day(db, actor, body.station_id, date.today())
+    tank=Tank(**body.model_dump()); db.add(tank); db.flush()
+    movement(db,tank,body.stock,date.today(),'opening',str(tank.id),actor.id)
+    return save(db,actor,tank,'tank.create')
 class NozzleInput(BaseModel):
     tank_id: int
     name: str = Field(min_length=1,max_length=60)
@@ -214,18 +234,25 @@ def inventory(station_id: int, db: DB, actor: Actor):
         return {'products':[], 'tanks':[], 'nozzles':db.scalars(select(Nozzle).where(Nozzle.id.in_(nozzle_ids))).all()}
     return {'products':db.scalars(select(Product).where(Product.station_id==station_id)).all(),'tanks':db.scalars(select(Tank).where(Tank.station_id==station_id)).all(),'nozzles':db.scalars(select(Nozzle).where(Nozzle.station_id==station_id)).all()}
 class OpenShift(BaseModel):
+    business_date: date = Field(default_factory=lambda: datetime.now(timezone.utc).date())
     nozzle_id: int
     attendant_id: int
 @app.post('/shifts')
 def open_shift(body: OpenShift, db: DB, actor: Actor):
     permit(actor,'owner','manager','supervisor')
-    nozzle=db.scalar(select(Nozzle).where(Nozzle.id==body.nozzle_id).with_for_update())
+    from .operations import writable_day
+    n=get(db,Nozzle,body.nozzle_id)
+    writable_day(db,actor,n.station_id,body.business_date)
+    nozzle=db.scalar(select(Nozzle).where(Nozzle.id==body.nozzle_id).with_for_update().execution_options(populate_existing=True))
     if not nozzle: raise HTTPException(404,'Nozzle not found')
     scoped(actor,nozzle.station_id); staff=get(db,User,body.attendant_id)
     if not staff.active or staff.role!='attendant' or staff.station_id!=nozzle.station_id: raise HTTPException(422,'Choose an active attendant at this station')
     if db.scalar(select(Shift).where(Shift.nozzle_id==nozzle.id,Shift.status.in_(['open','submitted']))): raise HTTPException(409,'Nozzle already has an active shift')
+    from .operations import Equipment
+    equipment=db.scalar(select(Equipment).where(Equipment.nozzle_id==nozzle.id))
+    if equipment and equipment.status!='operational': raise HTTPException(409,'Nozzle equipment is under maintenance')
     tank=get(db,Tank,nozzle.tank_id); product=get(db,Product,tank.product_id)
-    return save(db,actor,Shift(station_id=nozzle.station_id,nozzle_id=nozzle.id,attendant_id=staff.id,opening=nozzle.meter,price=product.price),'shift.open')
+    return save(db,actor,Shift(business_date=body.business_date,station_id=nozzle.station_id,nozzle_id=nozzle.id,attendant_id=staff.id,opening=nozzle.meter,price=product.price),'shift.open')
 @app.get('/shifts')
 def shifts(station_id: int, db: DB, actor: Actor):
     scoped(actor,station_id); stmt=select(Shift).where(Shift.station_id==station_id)
@@ -239,7 +266,10 @@ class SubmitShift(BaseModel):
 @app.post('/shifts/{id}/submit')
 def submit_shift(id: int, body: SubmitShift, db: DB, actor: Actor):
     permit(actor,'owner','manager','supervisor','attendant')
-    shift=db.scalar(select(Shift).where(Shift.id==id).with_for_update())
+    from .operations import writable_day
+    existing=get(db,Shift,id)
+    writable_day(db,actor,existing.station_id,existing.business_date)
+    shift=db.scalar(select(Shift).where(Shift.id==id).with_for_update().execution_options(populate_existing=True))
     if not shift: raise HTTPException(404,'Shift not found')
     scoped(actor,shift.station_id)
     if actor.role=='attendant' and actor.id!=shift.attendant_id: raise HTTPException(403,'Assigned attendant only')
@@ -247,21 +277,30 @@ def submit_shift(id: int, body: SubmitShift, db: DB, actor: Actor):
     if body.closing<shift.opening: raise HTTPException(422,'Closing meter cannot be below opening meter')
     for key,value in body.model_dump().items(): setattr(shift,key,value)
     shift.litres=body.closing-shift.opening; shift.expected=(shift.litres*shift.price).quantize(Decimal('0.01'))
-    shift.variance=body.cash+body.momo+body.card-shift.expected; shift.status='submitted'
+    from .operations import shift_credit
+    shift.credit, credit_litres=shift_credit(db,shift.id)
+    if credit_litres>shift.litres or shift.credit>shift.expected: raise HTTPException(422,'Meter sales are below the credit sales recorded for this shift')
+    shift.variance=body.cash+body.momo+body.card+shift.credit-shift.expected; shift.status='submitted'
     return save(db,actor,shift,'shift.submit')
 @app.post('/shifts/{id}/reconcile')
 def reconcile(id: int, db: DB, actor: Actor):
     permit(actor,'owner','manager','supervisor')
-    shift=db.scalar(select(Shift).where(Shift.id==id).with_for_update())
+    from .operations import writable_day
+    existing=get(db,Shift,id)
+    writable_day(db,actor,existing.station_id,existing.business_date)
+    shift=db.scalar(select(Shift).where(Shift.id==id).with_for_update().execution_options(populate_existing=True))
     if not shift: raise HTTPException(404,'Shift not found')
     scoped(actor,shift.station_id)
     if shift.status!='submitted': raise HTTPException(409,'Only submitted shifts can be reconciled')
-    nozzle=db.scalar(select(Nozzle).where(Nozzle.id==shift.nozzle_id).with_for_update())
-    tank=db.scalar(select(Tank).where(Tank.id==nozzle.tank_id).with_for_update())
+    nozzle=db.scalar(select(Nozzle).where(Nozzle.id==shift.nozzle_id).with_for_update().execution_options(populate_existing=True))
+    tank=db.scalar(select(Tank).where(Tank.id==nozzle.tank_id).with_for_update().execution_options(populate_existing=True))
     if shift.litres>tank.stock: raise HTTPException(409,'Insufficient recorded stock; investigate before reconciliation')
+    from .operations import movement
     tank.stock-=shift.litres; nozzle.meter=shift.closing; shift.status='reconciled'
+    movement(db,tank,-shift.litres,shift.business_date,'shift',str(shift.id),actor.id)
     return save(db,actor,shift,'shift.reconcile')
 class DeliveryInput(BaseModel):
+    business_date: date = Field(default_factory=lambda: datetime.now(timezone.utc).date())
     tank_id: int
     reference: str = Field(min_length=1,max_length=100)
     supplier: str = Field(min_length=1,max_length=120)
@@ -271,30 +310,37 @@ class DeliveryInput(BaseModel):
 @app.post('/deliveries')
 def delivery(body: DeliveryInput, db: DB, actor: Actor):
     permit(actor,'owner','manager','supervisor')
-    tank=db.scalar(select(Tank).where(Tank.id==body.tank_id).with_for_update())
+    from .operations import writable_day, movement
+    t=get(db,Tank,body.tank_id)
+    writable_day(db,actor,t.station_id,body.business_date)
+    tank=db.scalar(select(Tank).where(Tank.id==body.tank_id).with_for_update().execution_options(populate_existing=True))
     if not tank: raise HTTPException(404,'Tank not found')
     scoped(actor,tank.station_id)
     if db.scalar(select(Delivery).where(Delivery.station_id==tank.station_id,Delivery.reference==body.reference)): raise HTTPException(409,'Delivery already posted')
     if tank.stock+body.received_litres>tank.capacity: raise HTTPException(422,'Delivery exceeds tank capacity')
     tank.stock+=body.received_litres
-    return save(db,actor,Delivery(station_id=tank.station_id,**body.model_dump()),'delivery.post')
+    delivery=Delivery(station_id=tank.station_id,**body.model_dump()); db.add(delivery); db.flush()
+    movement(db,tank,body.received_litres,body.business_date,'delivery',str(delivery.id),actor.id)
+    return save(db,actor,delivery,'delivery.post')
 class ExpenseInput(BaseModel):
+    business_date: date = Field(default_factory=lambda: datetime.now(timezone.utc).date())
     station_id: int
     description: str = Field(min_length=1,max_length=300)
     amount: Decimal = Field(gt=0,max_digits=14,decimal_places=2)
 @app.post('/expenses')
 def expense(body: ExpenseInput, db: DB, actor: Actor):
     permit(actor,'owner','manager','accountant'); scoped(actor,body.station_id); get(db,Station,body.station_id)
-    return save(db,actor,Expense(**body.model_dump()),'expense.create')
-@app.get('/dashboard')
-def dashboard(station_id: int, db: DB, actor: Actor):
-    permit(actor,'owner','manager','accountant','auditor','supervisor'); scoped(actor,station_id)
-    day=datetime.now(timezone.utc).replace(hour=0,minute=0,second=0,microsecond=0)
-    rows=db.scalars(select(Shift).where(Shift.station_id==station_id,Shift.started>=day,Shift.status=='reconciled')).all()
-    expenses=db.scalars(select(Expense).where(Expense.station_id==station_id,Expense.created>=day)).all()
-    tanks=db.scalars(select(Tank).where(Tank.station_id==station_id)).all()
-    return {'litres':sum(s.litres for s in rows),'expected':sum(s.expected for s in rows),'collections':sum(s.cash+s.momo+s.card for s in rows),'variance':sum(s.variance for s in rows),'expenses':sum(e.amount for e in expenses),'alerts':[f'{t.name}: low stock ({t.stock} L)' for t in tanks if t.stock<=t.reorder]}
+    from .operations import writable_day
+    writable_day(db,actor,body.station_id,body.business_date)
+    return save(db,actor,Expense(recorded_by=actor.id,**body.model_dump()),'expense.create')
 @app.get('/audit')
 def audit_list(db: DB, actor: Actor):
     permit(actor,'owner')
     return db.scalars(select(Audit).order_by(Audit.id.desc()).limit(200)).all()
+
+# Register feature routers after the foundational definitions.
+from . import operations, security, reporting
+app.include_router(operations.router)
+app.include_router(security.router)
+app.include_router(reporting.router)
+security.install(app)

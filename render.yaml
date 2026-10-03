@@ -2,23 +2,39 @@ services:
   - type: web
     name: fuelflow-api
     runtime: python
+    plan: free
+    region: frankfurt
     rootDir: backend
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
-    healthCheckPath: /health
+    startCommand: python -m app.manage migrate && python -m uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /ready
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.11
+      - key: APP_ENV
+        value: production
+      - key: REQUIRE_OWNER_MFA
+        value: "true"
       - key: DATABASE_URL
         sync: false
       - key: JWT_SECRET
+        generateValue: true
+      - key: MFA_ENCRYPTION_SECRET
+        generateValue: true
+      - key: BOOTSTRAP_TOKEN
         generateValue: true
       - key: CORS_ORIGINS
         sync: false
   - type: web
     name: fuelflow-web
     runtime: node
+    plan: free
+    region: frankfurt
     rootDir: frontend
-    buildCommand: npm install && npm run build
+    buildCommand: npm ci && npm run build
     startCommand: npm start -- --hostname 0.0.0.0 --port $PORT
     envVars:
+      - key: NODE_VERSION
+        value: 22.16.0
       - key: NEXT_PUBLIC_API_URL
         sync: false
